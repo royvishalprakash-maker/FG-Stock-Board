@@ -289,7 +289,7 @@ with st.sidebar:
                     st.session_state.logged_in = True
                     st.session_state.user = username.strip()
                     st.session_state.role = role
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.error("Invalid credentials")
     else:
@@ -299,7 +299,7 @@ with st.sidebar:
             st.session_state.logged_in = False
             st.session_state.user = None
             st.session_state.role = None
-            st.experimental_rerun()
+            st.rerun()
 
 if not st.session_state.get("logged_in"):
     st.title("Multi-Rack FG Stock Board")
@@ -321,3 +321,4 @@ st.title("Multi-Rack FG Stock Board")
 col1, col2 = st.columns([3,1])
 with col1:
     st.m
+
