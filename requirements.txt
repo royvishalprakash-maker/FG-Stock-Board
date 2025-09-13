@@ -1,5 +1,5 @@
 streamlit
-streamlit-gsheets
+pandas
 gspread
 google-auth
-pandas
+gspread-dataframe
