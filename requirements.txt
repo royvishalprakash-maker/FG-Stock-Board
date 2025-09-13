@@ -1,6 +1,5 @@
 streamlit
-streamlit-gsheets
 pandas
+streamlit-gsheets
 gspread
 google-auth
-gspread-dataframe
