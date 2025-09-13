@@ -4,7 +4,8 @@ import pandas as pd
 from datetime import datetime
 import hashlib
 import math
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ----------------------------
 # App config
@@ -261,3 +262,4 @@ if can_output:
 
         st.subheader("History")
         st.dataframe(pd.DataFrame(st.session_state.history))
+
