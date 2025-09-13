@@ -1,10 +1,10 @@
-# multi_rack_fg_stock.py
+# multi_rack_fg_stock_gsheets.py
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 import hashlib
-import io
 import math
+from streamlit_gsheets import GSheetsConnection
 
 # ----------------------------
 # App config
@@ -12,7 +12,7 @@ import math
 st.set_page_config(page_title="Multi-Rack FG Stock Board", layout="wide")
 
 # ----------------------------
-# Demo authenticator (IN-APP demo only)
+# Authenticator
 # ----------------------------
 USERS = {
     "Vishal": {"pw_hash": hashlib.sha256(b"master123").hexdigest(), "role": "master"},
@@ -32,13 +32,67 @@ def login(username: str, password: str):
 # ----------------------------
 # Constants
 # ----------------------------
-PACKAGING_WEIGHT = 25.0  # kg per non-empty cell
-CELL_CAPACITY = 25       # pieces per cell
+PACKAGING_WEIGHT = 25.0
+CELL_CAPACITY = 25
 RACK_SPACES = {"A": 9, "B": 15, "C": 12, "D": 6, "E": 24, "F": 57}
 FIXED_ROWS = 3
 
 # ----------------------------
-# Init session state
+# Google Sheets Connection
+# ----------------------------
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+# Helpers for syncing
+def load_part_master():
+    df = conn.read(worksheet="part_master", ttl=5)
+    if df is None or df.empty:
+        return {}
+    return {row["Part No"]: {
+                "Weight": row["Weight"],
+                "Customer": row["Customer"],
+                "Tube Length": row["Tube Length (mm)"]}
+            for _, row in df.iterrows()}
+
+def save_part_master(part_master):
+    df = pd.DataFrame.from_dict(part_master, orient="index").reset_index()
+    df = df.rename(columns={"index":"Part No"})
+    conn.update(worksheet="part_master", data=df)
+
+def load_history():
+    df = conn.read(worksheet="history", ttl=5)
+    return [] if df is None or df.empty else df.to_dict("records")
+
+def save_history(history):
+    df = pd.DataFrame(history)
+    conn.update(worksheet="history", data=df)
+
+def load_racks():
+    df = conn.read(worksheet="racks", ttl=5)
+    racks = {}
+    for r, spaces in RACK_SPACES.items():
+        cols = math.ceil(spaces / FIXED_ROWS)
+        grid = [[{"Part No": None, "Quantity": 0} for _ in range(cols)] for _ in range(FIXED_ROWS)]
+        racks[r] = {"rows": FIXED_ROWS, "cols": cols, "array": grid, "spaces": spaces}
+
+    if df is not None and not df.empty:
+        for _, row in df.iterrows():
+            r = row["Rack"]; i = int(row["Row"])-1; j = int(row["Col"])-1
+            if r in racks:
+                racks[r]["array"][i][j] = {"Part No": row["Part No"], "Quantity": int(row["Quantity"])}
+    return racks
+
+def save_racks(racks):
+    rows = []
+    for rn, rack in racks.items():
+        for i in range(rack["rows"]):
+            for j in range(rack["cols"]):
+                c = rack["array"][i][j]
+                rows.append({"Rack": rn, "Row": i+1, "Col": j+1,
+                             "Part No": c["Part No"], "Quantity": c["Quantity"]})
+    conn.update(worksheet="racks", data=pd.DataFrame(rows))
+
+# ----------------------------
+# State Initialization
 # ----------------------------
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -46,98 +100,34 @@ if "logged_in" not in st.session_state:
     st.session_state.role = None
 
 if "part_master" not in st.session_state:
-    st.session_state.part_master = {
-        "10283026": {"Weight": 8.05, "Customer": "Mahindra Pune", "Tube Length": 1254},
-        "10291078": {"Weight": 7.90, "Customer": "Mahindra Pune", "Tube Length": 1245},
-        "10282069": {"Weight": 8.95, "Customer": "Mahindra Pune", "Tube Length": 1262},
-    }
+    st.session_state.part_master = load_part_master()
 
 if "racks" not in st.session_state:
-    racks = {}
-    for r, spaces in RACK_SPACES.items():
-        cols = math.ceil(spaces / FIXED_ROWS)
-        grid = [[{"Part No": None, "Quantity": 0} for _ in range(cols)] for _ in range(FIXED_ROWS)]
-        racks[r] = {"rows": FIXED_ROWS, "cols": cols, "array": grid, "spaces": spaces}
-    st.session_state.racks = racks
+    st.session_state.racks = load_racks()
 
 if "history" not in st.session_state:
-    st.session_state.history = []
+    st.session_state.history = load_history()
 
 # ----------------------------
-# Utilities
+# Utils
 # ----------------------------
-def ts_now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def ts_now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def cell_total_weight(cell):
-    pn, qty = cell["Part No"], cell["Quantity"]
-    if qty > 0 and pn:
-        pm = st.session_state.part_master.get(pn, {})
-        return qty * pm.get("Weight", 0.0) + PACKAGING_WEIGHT
-    return 0.0
-
-def total_weight_all():
-    return sum(
-        cell_total_weight(c)
-        for rack in st.session_state.racks.values()
-        for row in rack["array"]
-        for c in row
-    )
-
-def add_history(action, rack, row_ui, col_ui, part_no, qty, user, note=""):
-    st.session_state.history.insert(
-        0,
-        {
-            "Timestamp": ts_now(),
-            "User": user,
-            "Action": action,
-            "Rack": rack,
-            "Row": row_ui,
-            "Col": col_ui,
-            "Part No": part_no,
-            "Quantity": qty,
-            "Note": note,
-        },
-    )
-
-def prepare_rack_grid_csv():
-    rows = []
-    for rn, rack in st.session_state.racks.items():
-        for i in range(rack["rows"]):
-            for j in range(rack["cols"]):
-                c = rack["array"][i][j]
-                pm = st.session_state.part_master.get(c["Part No"], {}) if c["Part No"] else {}
-                rows.append(
-                    {
-                        "Rack": rn,
-                        "Row": i + 1,
-                        "Col": j + 1,
-                        "Part No": c["Part No"],
-                        "Customer": pm.get("Customer", ""),
-                        "Tube Length (mm)": pm.get("Tube Length", ""),
-                        "Quantity": c["Quantity"],
-                        "Total Weight (kg)": round(cell_total_weight(c), 2),
-                    }
-                )
-    return pd.DataFrame(rows)
-
-def prepare_part_master_csv_bytes():
-    df = pd.DataFrame.from_dict(st.session_state.part_master, orient="index").reset_index()
-    df = df.rename(columns={"index": "Part No"})
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
-
-def prepare_history_csv_bytes():
-    if not st.session_state.history:
-        return "".encode("utf-8")
-    df = pd.DataFrame(st.session_state.history)
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8")
+def add_history(action, rack, row_ui, col_ui, part_no, qty, user):
+    st.session_state.history.insert(0, {
+        "Timestamp": ts_now(),
+        "User": user,
+        "Action": action,
+        "Rack": rack,
+        "Row": row_ui,
+        "Col": col_ui,
+        "Part No": part_no,
+        "Quantity": qty
+    })
+    save_history(st.session_state.history)
 
 # ----------------------------
-# Authentication UI
+# Auth UI
 # ----------------------------
 with st.sidebar:
     st.title("Access")
@@ -165,7 +155,7 @@ with st.sidebar:
 
 if not st.session_state.logged_in:
     st.title("Multi-Rack FG Stock Board")
-    st.info("Welcome to the FG Stock Dashboard")
+    st.info("Welcome! Please login to continue.")
     st.stop()
 
 # ----------------------------
@@ -177,107 +167,97 @@ can_input = role in ("master", "input")
 can_output = role in ("master", "input", "output")
 
 # ----------------------------
-# Header
+# Main Layout
 # ----------------------------
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.title("Multi-Rack FG Stock Board")
-    st.caption(f"Signed in as {st.session_state.user} ({role})")
-with col2:
-    
-    total_qty = sum(c["Quantity"] for r in st.session_state.racks.values() for row in r["array"] for c in row)
-    st.metric("Total Qty", f"{total_qty}")
+st.title("Multi-Rack FG Stock Board")
 
-# ----------------------------
-# Tabs
-# ----------------------------
 tabs = []
 if can_master: tabs.append("Master")
 if can_input: tabs.append("Input")
 if can_output: tabs.append("Output")
 tab_objs = st.tabs(tabs)
 
-# MASTER Tab
+# Master Tab
 if can_master:
     with tab_objs[tabs.index("Master")]:
         st.subheader("Part Master")
-        with st.form("part_master_form"):
-            pn = st.text_input("Part No").strip()
-            wt = st.number_input("Weight (kg)", min_value=0.0, step=0.01, format="%.2f")
+        with st.form("part_form"):
+            pn = st.text_input("Part No")
+            wt = st.number_input("Weight (kg)", 0.0, step=0.01)
             cust = st.text_input("Customer")
-            tube = st.number_input("Tube Length (mm)", min_value=0, step=1)
-            if st.form_submit_button("Add / Update Part"):
+            tube = st.number_input("Tube Length (mm)", 0, step=1)
+            if st.form_submit_button("Add/Update"):
                 if pn:
-                    st.session_state.part_master[pn] = {"Weight": wt, "Customer": cust, "Tube Length": int(tube)}
+                    st.session_state.part_master[pn] = {"Weight": wt, "Customer": cust, "Tube Length": tube}
+                    save_part_master(st.session_state.part_master)
                     add_history("Master Update", "-", "-", "-", pn, 0, st.session_state.user)
                     st.success(f"Updated master for {pn}")
         st.dataframe(pd.DataFrame.from_dict(st.session_state.part_master, orient="index").reset_index().rename(columns={"index":"Part No"}))
-        st.download_button("⬇️ Download Part Master CSV", data=prepare_part_master_csv_bytes(), file_name="part_master.csv", mime="text/csv")
 
-# INPUT Tab
+# Input Tab
 if can_input:
     with tab_objs[tabs.index("Input")]:
         st.subheader("Stock Input")
         rack_ui = st.selectbox("Rack", options=list(st.session_state.racks.keys()))
         rack_data = st.session_state.racks[rack_ui]
-        ROWS, COLS = rack_data["rows"], rack_data["cols"]
 
         with st.form("stock_form", clear_on_submit=True):
-            row_ui = st.number_input("Row (bottom=1)", min_value=1, max_value=ROWS, value=1, step=1)
-            col_ui = st.number_input("Column", min_value=1, max_value=COLS, value=1, step=1)
+            row_ui = st.number_input("Row (bottom=1)", 1, rack_data["rows"])
+            col_ui = st.number_input("Column", 1, rack_data["cols"])
             part_no = st.selectbox("Part No", options=sorted(st.session_state.part_master.keys()))
-            qty = st.number_input("Quantity", min_value=1, step=1)
+            qty = st.number_input("Quantity", 1, step=1)
             action = st.radio("Action", ["Add", "Subtract"], horizontal=True)
             if st.form_submit_button("Apply"):
-                cell = rack_data["array"][row_ui - 1][col_ui - 1]
+                cell = rack_data["array"][row_ui-1][col_ui-1]
                 if action == "Add":
                     if cell["Part No"] in (None, part_no):
                         if cell["Quantity"] + qty <= CELL_CAPACITY:
                             cell["Part No"] = part_no
                             cell["Quantity"] += qty
                             add_history("Add", rack_ui, row_ui, col_ui, part_no, qty, st.session_state.user)
-                            st.success(f"Added {qty} of {part_no} at {rack_ui} R{row_ui} C{col_ui}")
+                            save_racks(st.session_state.racks)
+                            st.success(f"Added {qty} {part_no} in {rack_ui} R{row_ui}C{col_ui}")
                         else:
-                            st.error("Exceeds cell capacity")
+                            st.error("Exceeds capacity")
                     else:
-                        st.error("Cell already has a different part")
-                else:  # Subtract
+                        st.error("Cell holds different part")
+                else:
                     if cell["Part No"] == part_no and cell["Quantity"] >= qty:
                         cell["Quantity"] -= qty
                         if cell["Quantity"] == 0: cell["Part No"] = None
                         add_history("Subtract", rack_ui, row_ui, col_ui, part_no, qty, st.session_state.user)
-                        st.success(f"Subtracted {qty} from {rack_ui} R{row_ui} C{col_ui}")
+                        save_racks(st.session_state.racks)
+                        st.success(f"Subtracted {qty} from {rack_ui} R{row_ui}C{col_ui}")
                     else:
                         st.error("Mismatch or insufficient stock")
 
-        st.download_button("⬇️ Download Grid CSV", data=prepare_rack_grid_csv().to_csv(index=False).encode("utf-8"), file_name="grid.csv", mime="text/csv")
-
-# OUTPUT Tab
+# Output Tab
 if can_output:
     with tab_objs[tabs.index("Output")]:
         st.subheader("Rack Overview")
-        out_rack = st.selectbox("Select Rack to View", options=list(st.session_state.racks.keys()))
-        st.dataframe(prepare_rack_grid_csv().query("Rack == @out_rack"))
+        rack_sel = st.selectbox("Select Rack", options=list(st.session_state.racks.keys()))
+        rows = []
+        for i in range(st.session_state.racks[rack_sel]["rows"]):
+            for j in range(st.session_state.racks[rack_sel]["cols"]):
+                c = st.session_state.racks[rack_sel]["array"][i][j]
+                rows.append({"Rack": rack_sel, "Row": i+1, "Col": j+1,
+                             "Part No": c["Part No"], "Quantity": c["Quantity"]})
+        st.dataframe(pd.DataFrame(rows))
 
-        st.subheader("FIFO Part Finder")
-        search_part = st.text_input("Part No")
-        if st.button("Find FIFO Cell"):
+        st.subheader("FIFO Finder")
+        search_part = st.text_input("Part No to Pick (FIFO)")
+        if st.button("Find FIFO"):
             fifo = None
             for ev in reversed(st.session_state.history):
                 if ev["Action"]=="Add" and ev["Part No"]==search_part:
-                    rk,row_ui,col_ui = ev["Rack"], ev["Row"], ev["Col"]
-                    cell = st.session_state.racks[rk]["array"][row_ui-1][col_ui-1]
+                    r,row_ui,col_ui = ev["Rack"], ev["Row"], ev["Col"]
+                    cell = st.session_state.racks[r]["array"][row_ui-1][col_ui-1]
                     if cell["Part No"]==search_part and cell["Quantity"]>0:
-                        fifo = ev
-                        break
+                        fifo = ev; break
             if fifo:
-                st.success(f"FIFO pick: Rack {fifo['Rack']} R{fifo['Row']} C{fifo['Col']} (Qty: {cell['Quantity']})")
+                st.success(f"Pick from Rack {fifo['Rack']} R{fifo['Row']} C{fifo['Col']} (Qty {cell['Quantity']})")
             else:
-                st.warning("No FIFO candidate found")
+                st.warning("No available FIFO stock")
 
-        st.subheader("History Log")
-        if st.session_state.history:
-            st.dataframe(pd.DataFrame(st.session_state.history))
-            st.download_button("⬇️ Download History CSV", data=prepare_history_csv_bytes(), file_name="history.csv", mime="text/csv")
-        else:
-            st.info("No history yet")
+        st.subheader("History")
+        st.dataframe(pd.DataFrame(st.session_state.history))
